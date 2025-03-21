@@ -5,6 +5,7 @@ set -o pipefail
 set -o nounset
 
 export RELEASE_BRANCH="release-2.8-ish"
+export RELEASE_VERSION="v2.8.0-fork"
 export PREVIOUS_VERSION="v2.7.1"
 # Token must be generated and set locally. Go to your GitHub Profile,
 # then Developer Settings, then Personal access tokens, then Fine-grained tokens.
