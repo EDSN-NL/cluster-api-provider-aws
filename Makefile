@@ -35,7 +35,7 @@ API_FILES := $(foreach dir, $(API_DIRS), $(call rwildcard,../../$(dir),*.go))
 
 BIN_DIR := bin
 REPO_ROOT := $(shell git rev-parse --show-toplevel)
-GH_ORG_NAME ?= kubernetes-sigs
+GH_ORG_NAME ?= EDSN-NL
 GH_REPO_NAME ?= cluster-api-provider-aws
 GH_REPO ?= $(GH_ORG_NAME)/$(GH_REPO_NAME)
 TEST_E2E_DIR := test/e2e
