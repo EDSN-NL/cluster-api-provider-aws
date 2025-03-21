@@ -80,7 +80,7 @@ providers:
   - name: aws
     type: InfrastructureProvider
     versions:
-      - name: v2.0.99
+      - name: v9.9.99
         # Use manifest from source files
         value: ../../../config/default
         contract: v1beta1
@@ -114,6 +114,8 @@ providers:
         targetName: "cluster-template-eks-ipv6-cluster.yaml"
       - sourcePath: "./eks/cluster-template-eks-control-plane-only-legacy.yaml"
         targetName: "cluster-template-eks-control-plane-only-legacy.yaml"
+      - sourcePath: "./eks/cluster-template-eks-control-plane-bare-eks.yaml"
+        targetName: "cluster-template-eks-control-plane-bare-eks.yaml"
 
 variables:
   KUBERNETES_VERSION: "v1.31.0"

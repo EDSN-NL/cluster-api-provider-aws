@@ -51,11 +51,16 @@ import (
 	"sigs.k8s.io/cluster-api-provider-aws/v2/pkg/cloud/services/securitygroup"
 	"sigs.k8s.io/cluster-api-provider-aws/v2/pkg/logger"
 	infrautilconditions "sigs.k8s.io/cluster-api-provider-aws/v2/util/conditions"
+	"sigs.k8s.io/cluster-api-provider-aws/v2/util/paused"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util"
 	capiannotations "sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/predicates"
+)
+
+const (
+	deleteRequeueAfter = 20 * time.Second
 )
 
 var defaultAWSSecurityGroupRoles = []infrav1.SecurityGroupRole{
@@ -126,7 +131,7 @@ func (r *AWSClusterReconciler) getSecurityGroupService(scope scope.ClusterScope)
 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=awsclusters,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=awsclusters/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=awsclusterroleidentities;awsclusterstaticidentities,verbs=get;list;watch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=awsclustercontrolleridentities,verbs=get;list;watch;create
 
@@ -163,9 +168,8 @@ func (r *AWSClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	log = log.WithValues("cluster", klog.KObj(cluster))
 
-	if capiannotations.IsPaused(cluster, awsCluster) {
-		log.Info("AWSCluster or linked Cluster is marked as paused. Won't reconcile")
-		return reconcile.Result{}, nil
+	if isPaused, conditionChanged, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, cluster); err != nil || isPaused || conditionChanged {
+		return ctrl.Result{}, err
 	}
 
 	// Create the scope.
@@ -191,20 +195,33 @@ func (r *AWSClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// Handle deleted clusters
 	if !awsCluster.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, r.reconcileDelete(ctx, clusterScope)
+		return r.reconcileDelete(ctx, clusterScope)
 	}
 
 	// Handle non-deleted clusters
 	return r.reconcileNormal(clusterScope)
 }
 
-func (r *AWSClusterReconciler) reconcileDelete(ctx context.Context, clusterScope *scope.ClusterScope) error {
+func (r *AWSClusterReconciler) reconcileDelete(ctx context.Context, clusterScope *scope.ClusterScope) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(clusterScope.AWSCluster, infrav1.ClusterFinalizer) {
 		clusterScope.Info("No finalizer on AWSCluster, skipping deletion reconciliation")
-		return nil
+		return reconcile.Result{}, nil
 	}
 
 	clusterScope.Info("Reconciling AWSCluster delete")
+
+	numDependencies, err := r.dependencyCount(ctx, clusterScope)
+	if err != nil {
+		clusterScope.Error(err, "error getting AWSCluster dependencies")
+		return reconcile.Result{}, err
+	}
+
+	if numDependencies > 0 {
+		clusterScope.Info("AWSCluster cluster still has dependencies - requeue needed", "dependencyCount", numDependencies)
+		return reconcile.Result{RequeueAfter: deleteRequeueAfter}, nil
+	}
+
+	clusterScope.Info("AWSCluster has no dependent CAPI resources, proceeding with its deletion")
 
 	ec2svc := r.getEC2Service(clusterScope)
 	elbsvc := r.getELBService(clusterScope)
@@ -257,12 +274,12 @@ func (r *AWSClusterReconciler) reconcileDelete(ctx context.Context, clusterScope
 	}
 
 	if len(allErrs) > 0 {
-		return kerrors.NewAggregate(allErrs)
+		return reconcile.Result{}, kerrors.NewAggregate(allErrs)
 	}
 
 	// Cluster is deleted so remove the finalizer.
 	controllerutil.RemoveFinalizer(clusterScope.AWSCluster, infrav1.ClusterFinalizer)
-	return nil
+	return reconcile.Result{}, nil
 }
 
 func (r *AWSClusterReconciler) reconcileLoadBalancer(clusterScope *scope.ClusterScope, awsCluster *infrav1.AWSCluster) (*time.Duration, error) {
@@ -375,7 +392,7 @@ func (r *AWSClusterReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Ma
 	controller, err := ctrl.NewControllerManagedBy(mgr).
 		WithOptions(options).
 		For(&infrav1.AWSCluster{}).
-		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), log.GetLogger(), r.WatchFilterValue)).
+		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), log.GetLogger(), r.WatchFilterValue)).
 		WithEventFilter(
 			predicate.Funcs{
 				// Avoid reconciling if the event triggering the reconciliation is related to incremental status updates
@@ -483,4 +500,25 @@ func (r *AWSClusterReconciler) checkForExternalControlPlaneLoadBalancer(clusterS
 
 		return nil
 	}
+}
+
+func (r *AWSClusterReconciler) dependencyCount(ctx context.Context, clusterScope *scope.ClusterScope) (int, error) {
+	clusterName := clusterScope.Name()
+	namespace := clusterScope.Namespace()
+
+	clusterScope.Info("Looking for AWSCluster dependencies")
+
+	listOptions := []client.ListOption{
+		client.InNamespace(namespace),
+		client.MatchingLabels(map[string]string{clusterv1.ClusterNameLabel: clusterName}),
+	}
+
+	machines := &infrav1.AWSMachineList{}
+	if err := r.Client.List(ctx, machines, listOptions...); err != nil {
+		return 0, fmt.Errorf("failed to list machines for cluster %s/%s: %w", namespace, clusterName, err)
+	}
+
+	clusterScope.Debug("Found dependent machines", "count", len(machines.Items))
+
+	return len(machines.Items), nil
 }
